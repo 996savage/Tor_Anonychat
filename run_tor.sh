@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  SecureChat over Tor — run_tor.sh
-#  Entry point for BOTH the host and the guest.
+#  Host fetches their own onion address manually, pastes it in, gets a code.
+#  Guest enters onion address + code to connect.
 #  No IP addresses ever leave either machine.
 # =============================================================================
-set -euo pipefail
 
-# Always run from the directory this script lives in
 cd "$(dirname "$0")"
 
 # ---------------------------------------------------------------------------
-# Colours — use printf so they work on every POSIX shell / terminal
+# Colours
 # ---------------------------------------------------------------------------
 RED='\033[0;31m'
 GRN='\033[0;32m'
 YEL='\033[1;33m'
 CYN='\033[0;36m'
-MAG='\033[0;35m'
 DIM='\033[2m'
 RST='\033[0m'
 
-p() { printf "%b\n" "$@"; }   # portable coloured print
+p() { printf "%b\n" "$@"; }
 
 # ---------------------------------------------------------------------------
 # Dependency checks
@@ -32,8 +30,7 @@ check_python() {
     fi
     if ! python3 -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM" 2>/dev/null; then
         p "${YEL}[*] Installing Python dependency: cryptography${RST}"
-        pip install cryptography --break-system-packages 2>/dev/null \
-            || pip install cryptography
+        pip install cryptography --break-system-packages 2>/dev/null || pip install cryptography
     fi
 }
 
@@ -42,16 +39,15 @@ check_tor() {
         p "${YEL}[!] Tor not found — installing...${RST}"
         sudo apt-get update -qq && sudo apt-get install -y tor
     fi
-    if ! systemctl is-active --quiet tor 2>/dev/null; then
-        p "${YEL}[!] Starting Tor service...${RST}"
-        sudo systemctl start tor
-        sleep 4
-    fi
-    if systemctl is-active --quiet tor 2>/dev/null; then
+    if systemctl is-active --quiet tor@default 2>/dev/null; then
+        p "${GRN}[+] Tor is running (tor@default)${RST}"
+    elif systemctl is-active --quiet tor 2>/dev/null; then
         p "${GRN}[+] Tor is running${RST}"
     else
-        p "${RED}[!] Tor failed to start. Try: sudo systemctl start tor${RST}"
-        exit 1
+        p "${YEL}[!] Starting Tor...${RST}"
+        sudo systemctl start tor@default 2>/dev/null || sudo systemctl start tor
+        sleep 4
+        p "${GRN}[+] Tor started${RST}"
     fi
 }
 
@@ -61,45 +57,6 @@ check_torsocks() {
         sudo apt-get install -y torsocks
     fi
     p "${GRN}[+] torsocks ready${RST}"
-}
-
-# ---------------------------------------------------------------------------
-# Read / create Tor hidden service for SecureChat
-# ---------------------------------------------------------------------------
-setup_hidden_service() {
-    local torrc=/etc/tor/torrc
-    local hs_dir=/var/lib/tor/securechat
-
-    # Create directory with correct ownership
-    if [ ! -d "$hs_dir" ]; then
-        sudo mkdir -p "$hs_dir"
-        sudo chown debian-tor:debian-tor "$hs_dir" 2>/dev/null \
-            || sudo chown tor:tor "$hs_dir" 2>/dev/null || true
-        sudo chmod 700 "$hs_dir"
-    fi
-
-    # Append hidden-service config to torrc if not already present
-    if ! grep -q "HiddenServiceDir $hs_dir" "$torrc" 2>/dev/null; then
-        p "${YEL}[!] Adding SecureChat hidden service to torrc...${RST}"
-        printf "\n# SecureChat hidden service\nHiddenServiceDir %s\nHiddenServicePort 57311 127.0.0.1:57311\n" \
-            "$hs_dir" | sudo tee -a "$torrc" >/dev/null
-        sudo systemctl restart tor
-        p "${YEL}[*] Waiting for Tor to generate onion keys (up to 30 s)...${RST}"
-        local waited=0
-        while [ ! -f "$hs_dir/hostname" ] && [ "$waited" -lt 30 ]; do
-            sleep 2; waited=$((waited+2))
-            printf "."
-        done
-        printf "\n"
-    fi
-
-    if [ ! -f "$hs_dir/hostname" ]; then
-        p "${RED}[!] Onion address not generated yet. Wait a moment and retry.${RST}"
-        exit 1
-    fi
-
-    ONION=$(sudo cat "$hs_dir/hostname" | tr -d '[:space:]')
-    export ONION
 }
 
 # ---------------------------------------------------------------------------
@@ -122,68 +79,144 @@ show_menu() {
     printf "\n"
     printf "%b\n" "${CYN}  Select an option:${RST}"
     printf "\n"
-    printf "%b\n" "    ${GRN}[1]${RST}  Host a session   (start listener, get onion address)"
-    printf "%b\n" "    ${GRN}[2]${RST}  Join a session   (enter onion address + code)"
-    printf "%b\n" "    ${GRN}[3]${RST}  Exit"
+    printf "%b\n" "    ${GRN}[1]${RST}  Host a session"
+    printf "%b\n" "    ${GRN}[2]${RST}  Join a session"
+    printf "%b\n" "    ${GRN}[3]${RST}  Show my onion address"
+    printf "%b\n" "    ${GRN}[4]${RST}  Exit"
     printf "\n"
 }
 
 # ---------------------------------------------------------------------------
+# Show the onion address — host runs this first in a separate terminal
+# or uses option 3 before starting host mode
+# ---------------------------------------------------------------------------
+show_onion_address() {
+    clear
+    p "${CYN}  === YOUR ONION ADDRESS ===${RST}"
+    printf "\n"
+
+    # Try the two possible hostname locations
+    local hostname_file=""
+    if [ -f "/var/lib/tor/securechat/hostname" ]; then
+        hostname_file="/var/lib/tor/securechat/hostname"
+    elif [ -f "/var/lib/tor/hidden_service/hostname" ]; then
+        hostname_file="/var/lib/tor/hidden_service/hostname"
+    fi
+
+    if [ -n "$hostname_file" ]; then
+        local onion
+        onion=$(sudo cat "$hostname_file" | tr -d '[:space:]')
+        printf "\n"
+        printf "%b\n" "${YEL}  +----------------------------------------------------------+"
+        printf "%b\n" "  |                                                          |"
+        printf          "  |   ${CYN}%-58s${YEL}|  \n"  "$onion"
+        printf "%b\n" "  |                                                          |"
+        printf "%b\n" "  +----------------------------------------------------------+${RST}"
+        printf "\n"
+        p "${DIM}  Copy the address above. You will paste it when you start host mode.${RST}"
+    else
+        printf "\n"
+        p "${RED}  [!] No onion address found yet.${RST}"
+        p "${YEL}  Run these commands to set up your hidden service first:${RST}"
+        printf "\n"
+        printf "%b\n" "${DIM}  ── Setup commands ────────────────────────────────────────"
+        printf "%b\n" ""
+        printf "%b\n" "  1. Add hidden service to Tor config:"
+        printf "%b\n" "${CYN}     sudo bash -c 'printf \"\\n# SecureChat\\nHiddenServiceDir /var/lib/tor/securechat\\nHiddenServicePort 57311 127.0.0.1:57311\\n\" >> /etc/tor/instances/default/torrc'${RST}"
+        printf "%b\n" ""
+        printf "%b\n" "     (If that path does not exist, use /etc/tor/torrc instead)"
+        printf "%b\n" ""
+        printf "%b\n" "  2. Create the directory:"
+        printf "%b\n" "${CYN}     sudo mkdir -p /var/lib/tor/securechat${RST}"
+        printf "%b\n" "${CYN}     sudo chown debian-tor:debian-tor /var/lib/tor/securechat${RST}"
+        printf "%b\n" "${CYN}     sudo chmod 700 /var/lib/tor/securechat${RST}"
+        printf "%b\n" ""
+        printf "%b\n" "  3. Restart Tor:"
+        printf "%b\n" "${CYN}     sudo systemctl restart tor@default${RST}"
+        printf "%b\n" ""
+        printf "%b\n" "  4. Wait ~15 seconds, then read your onion address:"
+        printf "%b\n" "${CYN}     sudo cat /var/lib/tor/securechat/hostname${RST}"
+        printf "%b\n" ""
+        printf "%b\n" "  ──────────────────────────────────────────────────────────${RST}"
+        printf "\n"
+        p "${DIM}  Once you have the address, come back and choose option 1 to host.${RST}"
+    fi
+
+    printf "\n"
+    printf "  Press Enter to return to menu..."
+    read -r _
+}
+
+# ---------------------------------------------------------------------------
 # HOST MODE
-# Binds locally — Tor routes inbound hidden-service traffic to port 57311.
-# No torsocks needed here; only the guest uses torsocks.
+# User pastes their onion address, gets a session code, shares both out-of-band
 # ---------------------------------------------------------------------------
 host_mode() {
     clear
     p "${GRN}  === HOST MODE ===${RST}"
     printf "\n"
+    p "${DIM}  You need your onion address before continuing.${RST}"
+    p "${DIM}  If you don't have it yet, press Ctrl+C, choose option 3 first.${RST}"
+    printf "\n"
 
-    setup_hidden_service
+    # Prompt host to paste their onion address
+    printf "  Paste your onion address (.onion) : "
+    read -r HOST_ONION
+    HOST_ONION=$(printf "%s" "$HOST_ONION" | tr -d '[:space:]')
 
-    # Derive session code by running a tiny Python snippet
+    if [[ ! "$HOST_ONION" =~ \.onion$ ]]; then
+        p "${RED}[!] That doesn't look like a valid .onion address.${RST}"
+        sleep 2
+        return
+    fi
+
+    # Generate session code
+    p "${DIM}[*] Generating session code...${RST}"
+    local SESSION_CODE
     SESSION_CODE=$(python3 -c "
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath('.')))
 sys.path.insert(0, '.')
 from securechat.crypto import generate_session_code
 print(generate_session_code())
 ")
 
+    if [ -z "$SESSION_CODE" ]; then
+        p "${RED}[!] Failed to generate session code.${RST}"
+        p "${RED}    Make sure securechat/crypto.py exists in this directory.${RST}"
+        sleep 3
+        return
+    fi
+
+    # Display what to share with the guest
     printf "\n"
-    p "${GRN}  Your Tor hidden service is ready.${RST}"
-    p "${GRN}  Send BOTH items below to the person you want to chat with:${RST}"
+    p "${GRN}  Send BOTH of these to your guest via phone/Signal/any out-of-band channel:${RST}"
     printf "\n"
     printf "%b\n" "${YEL}  +----------------------------------------------------------+"
     printf "%b\n" "  |                                                          |"
-    printf   "  |   Onion address :  ${CYN}%-38s${YEL}|  \n"  "${ONION}"
-    printf   "  |   Session code  :  ${CYN}%-38s${YEL}|  \n"  "${SESSION_CODE}"
+    printf          "  |   Onion address :  ${CYN}%-38s${YEL}|  \n"  "$HOST_ONION"
+    printf          "  |   Session code  :  ${CYN}%-38s${YEL}|  \n"  "$SESSION_CODE"
     printf "%b\n" "  |                                                          |"
     printf "%b\n" "  +----------------------------------------------------------+${RST}"
     printf "\n"
-    p "${DIM}  Share via phone call, Signal, or any out-of-band channel.${RST}"
-    p "${DIM}  Do NOT share over an unencrypted channel.${RST}"
+    p "${RED}  Do NOT send these over unencrypted channels.${RST}"
     printf "\n"
-    p "${YEL}  Waiting for guest to connect... (15-minute timeout)${RST}"
-    p "${DIM}  Press Ctrl+C to cancel.${RST}"
+    p "${YEL}  Waiting for guest to connect... (Ctrl+C to cancel)${RST}"
     printf "\n"
 
-    # Export so securechat.py's run_host() knows we are in tor mode
     export SECURECHAT_TOR_MODE=1
     export SECURECHAT_SESSION_CODE="$SESSION_CODE"
 
-    # Run securechat host — plain python3, NO torsocks
     python3 -m securechat host --port 57311
 }
 
 # ---------------------------------------------------------------------------
 # GUEST / CONNECT MODE
-# Uses torsocks to route the TCP connection through Tor to the .onion address.
 # ---------------------------------------------------------------------------
 connect_mode() {
     clear
     p "${GRN}  === CONNECT MODE ===${RST}"
     printf "\n"
-    p "  Enter the details shared by the host:"
+    p "  Enter the details sent to you by the host:"
     printf "\n"
 
     printf "  Onion address  (xxxx...xxxx.onion) : "
@@ -207,15 +240,13 @@ connect_mode() {
     fi
 
     printf "\n"
-    p "${YEL}  Routing through Tor to ${GUEST_ONION}...${RST}"
-    p "${DIM}  Tor circuits may take 15-30 seconds to build. Please wait.${RST}"
+    p "${YEL}  Connecting to ${GUEST_ONION} via Tor...${RST}"
+    p "${DIM}  Circuit build may take 15-30 seconds. Please wait.${RST}"
     printf "\n"
 
-    # Pre-fill host address so securechat.py's run_connect() skips the prompt
     export SECURECHAT_PEER_HOST="$GUEST_ONION"
     export SECURECHAT_PEER_CODE="$GUEST_CODE"
 
-    # torsocks intercepts all TCP calls and tunnels them through Tor
     torsocks python3 -m securechat connect --port 57311
 }
 
@@ -224,23 +255,25 @@ connect_mode() {
 # ---------------------------------------------------------------------------
 main() {
     show_banner
+    sudo -v
     check_python
     check_tor
     check_torsocks
 
     while true; do
         show_menu
-        printf "  Choice [1/2/3]: "
+        printf "  Choice [1/2/3/4]: "
         read -r choice
         case "$choice" in
-            1) host_mode    ;;
-            2) connect_mode ;;
-            3)
+            1) host_mode         ;;
+            2) connect_mode      ;;
+            3) show_onion_address ;;
+            4)
                 clear
                 p "${GRN}  SecureChat closed. No logs. No history. No trace.${RST}"
                 exit 0
                 ;;
-            *) p "${RED}  Invalid choice — enter 1, 2, or 3.${RST}" ;;
+            *) p "${RED}  Invalid choice.${RST}" ;;
         esac
     done
 }
