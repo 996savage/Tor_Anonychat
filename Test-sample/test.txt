@@ -1,1 +1,59 @@
+STEPS ON HOW TOR START AND MAKE THE TOR CONECTION
+1.This How to check your onion address--->>
+sudo cat /var/lib/tor/securechat/hostname
+
+2.Fast connection procedure
+(For host)
+cd ~/Tor_Anonychat
+python3 -m securechat host --port 57311
+
+(Guest Mode)
+cd ~/Tor_Anonychat
+python3 -m securechat connect --port 57311
+^^^^^^^^^^^^^For all the above
+ (can start even wlan local connectio by entering hosts ip address and Session code)
+
+most recommended for tor:
+torsocks python3 -m securechat <<connect/host(Depending on whatever you want to use)>> --port 57311
+
+
+NOTE: Make sure tor is up and working before starting any mode
+
+# Step 1 — is tor@default actually running now?
+systemctl is-active tor@default
+
+# Step 2 — is SOCKS port open?
+ss -tlnp | grep 9050
+
+# Step 3 — can torsocks reach Tor at all?
+torsocks curl https://check.torproject.org/api/ip 2>&1
+
+(For python listener checking if its bound to port 57311)
+ss -tlnp | grep 57311
+
+
+To force Connection to this port by bypassing Torsocks configs
+cd ~/Tor_Anonychat
+TORSOCKS_TOR_PORT=9050 torsocks python3 -m securechat connect --port 57311
+# if that fails try 9150
+TORSOCKS_TOR_PORT=9150 torsocks python3 -m securechat connect --port 57311
+
+
+If you encounter any Problem with the app you can Reach out for help
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
