@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""
-securechat/securechat.py  —  Main launcher
-════════════════════════════════════════════
-Intended entry point: bash run_tor.sh
 
-Direct usage:
-  python3 -m securechat host     [--port N]
-  python3 -m securechat connect  [--port N]
-  python3 -m securechat          (interactive menu)
-"""
 
 import sys
 import os
@@ -16,20 +7,17 @@ import argparse
 import time
 import signal
 
-# ── Silence shell history ────────────────────────────────────────────────────
 os.environ["HISTFILE"]     = "/dev/null"
 os.environ["HISTSIZE"]     = "0"
 os.environ["HISTFILESIZE"] = "0"
 
-# ── Package-relative imports ─────────────────────────────────────────────────
 from . import crypto, network, protocol
 from .session import Session
 from .protocol import Message, MsgType
 from .ui import ChatUI, make_outgoing_msg
 from .network import DEFAULT_PORT, get_local_ip
+from .filetransfer import FileTransferChannel, RECV_DIR
 
-
-# ── Simple ANSI helpers (pre-curses phase only) ───────────────────────────────
 G   = "\033[0;32m"
 GB  = "\033[1;32m"
 Y   = "\033[1;33m"
@@ -52,9 +40,6 @@ def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HOST MODE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_host(port: int) -> None:
     """
@@ -81,17 +66,12 @@ def run_host(port: int) -> None:
         _p(G  + "  Code  : " + CB + code + R)
         _p()
         _p(DIM + "  (send both to your guest over a secure channel)" + R)
-    elif not tor_mode:
-        # Only call get_local_ip() in direct (non-Tor) mode — never under torsocks
+    else:
         my_ip = get_local_ip()
         _p(G  + "  Your IP : " + CB + my_ip + R)
         _p(G  + "  Code    : " + CB + code + R)
         _p()
         _p(DIM + "  (share both with your guest)" + R)
-    else:
-        _p(G  + "  Code  : " + CB + code + R)
-        _p()
-        _p(DIM + "  (share your onion address and this code with your guest)" + R)
 
     _p()
     _p(DIM + "  Port: " + str(port) + "  |  Auto-timeout: 15 minutes" + R)
@@ -137,9 +117,6 @@ def run_host(port: int) -> None:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONNECT (GUEST) MODE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_connect(port: int) -> None:
     """
@@ -219,10 +196,7 @@ def run_connect(port: int) -> None:
         via_tor=via_tor,
     )
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  SHARED: start Session + ChatUI
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_chat(
     conn,
@@ -257,6 +231,15 @@ def _run_chat(
     )
     ui._session = session
 
+    # Wire up file transfer 
+    ft = FileTransferChannel(
+        session=session,
+        key=key,
+        push_system=ui.push_system,
+        push_progress=ui.push_system,
+    )
+    ft.install()
+
     # Patch send_text: sends over wire AND echoes locally with sentinel
     _orig_send = session.send_text
 
@@ -266,7 +249,7 @@ def _run_chat(
 
     session.send_text = _patched_send
 
-    # Replace _handle_enter to use the patched send (prevents double-echo)
+    # Replace _handle_enter with file-transfer-aware version
     def _handle_enter(self=ui):
         buf = "".join(self._input_buf).strip()
         self._input_buf.clear()
@@ -274,19 +257,64 @@ def _run_chat(
 
         if not buf:
             return None
+
+        # Quit 
         if buf.lower() in ("/quit", "/exit", "/q"):
             return "quit"
+
+        # Help 
         if buf.lower() == "/help":
             self.push_system(
-                "Commands: /quit  /clear  /help  |  Up/Down to scroll  |  Ctrl-W clear input"
+                "Commands: /quit  /clear  /help  |  ↑↓ scroll  |  Ctrl-W clear input"
+            )
+            self.push_system(
+                "File transfer: /sendfile <path>  |  /accept  |  /reject"
+            )
+            self.push_system(
+                f"Received files saved to: ~/securechat_received/"
             )
             return None
+
+        # ── Clear 
         if buf.lower() == "/clear":
             with self._msg_lock:
                 self._messages.clear()
             self._scroll = 0
             self._dirty.set()
             return None
+
+        # ── Send file 
+        if buf.lower().startswith("/sendfile"):
+            parts = buf.split(None, 1)
+            if len(parts) < 2 or not parts[1].strip():
+                self.push_system("Usage: /sendfile <path>   e.g. /sendfile ~/docs/file.pdf")
+                return None
+            path_str = parts[1].strip()
+            if not session.is_alive:
+                self.push_system("Session is closed — cannot send files.")
+                return None
+            ft.send_file(path_str)
+            return None
+
+        # ── Accept incoming file 
+        if buf.lower() in ("/accept", "/accept file"):
+            if not ft.has_pending_offer():
+                self.push_system("No pending file offer to accept.")
+                return None
+            ft.accept_offer()
+            return None
+
+        # ── Reject incoming file 
+        if buf.lower().startswith("/reject"):
+            if not ft.has_pending_offer():
+                self.push_system("No pending file offer to reject.")
+                return None
+            parts  = buf.split(None, 1)
+            reason = parts[1].strip() if len(parts) > 1 else "declined"
+            ft.reject_offer(reason)
+            return None
+
+        # ── Regular chat message 
         if session.is_alive:
             try:
                 session.send_text(buf)
@@ -304,6 +332,10 @@ def _run_chat(
         "Secure channel open" + tor_note +
         " — AES-256-GCM — 15 min limit — /help for commands"
     )
+    ui.push_system(
+        f"File transfer ready — /sendfile <path> to send  |  "
+        f"files saved to ~/securechat_received/"
+    )
 
     try:
         ui.run()
@@ -313,9 +345,7 @@ def _run_chat(
         _wipe_and_exit()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  CLEANUP
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _wipe_and_exit() -> None:
     clear()
@@ -325,9 +355,8 @@ def _wipe_and_exit() -> None:
     clear()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  INTERACTIVE MENU  (direct invocation without run_tor.sh)
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 def interactive_menu(port: int) -> None:
     clear()
@@ -348,10 +377,6 @@ def interactive_menu(port: int) -> None:
         clear()
         sys.exit(0)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     if sys.version_info < (3, 8):
