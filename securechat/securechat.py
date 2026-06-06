@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
+"""
+securechat/securechat.py  —  Main launcher
+════════════════════════════════════════════
+Entry point: bash run_tor.sh
 
+Direct usage:
+  python3 -m securechat host     [--port N]
+  python3 -m securechat connect  [--port N]
+  python3 -m securechat          (interactive menu)
+"""
 
 import sys
 import os
@@ -7,6 +16,7 @@ import argparse
 import time
 import signal
 
+# Silence shell history
 os.environ["HISTFILE"]     = "/dev/null"
 os.environ["HISTSIZE"]     = "0"
 os.environ["HISTFILESIZE"] = "0"
@@ -16,8 +26,9 @@ from .session import Session
 from .protocol import Message, MsgType
 from .ui import ChatUI, make_outgoing_msg
 from .network import DEFAULT_PORT, get_local_ip
-from .filetransfer import FileTransferChannel, RECV_DIR
+from .filetransfer import FileTransferChannel
 
+# ANSI helpers (pre-curses phase only)
 G   = "\033[0;32m"
 GB  = "\033[1;32m"
 Y   = "\033[1;33m"
@@ -40,16 +51,11 @@ def clear():
     os.system("cls" if os.name == "nt" else "clear")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HOST MODE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_host(port: int) -> None:
-    """
-    Bind and wait for one incoming guest connection.
-
-    run_tor.sh pre-sets these env vars so securechat.py doesn't duplicate output:
-      SECURECHAT_TOR_MODE      = "1"
-      SECURECHAT_SESSION_CODE  = pre-generated code
-      ONION                    = the hidden service address
-    """
     tor_mode   = os.environ.get("SECURECHAT_TOR_MODE", "").strip() == "1"
     ext_code   = os.environ.get("SECURECHAT_SESSION_CODE", "").strip()
     onion_addr = os.environ.get("ONION", "").strip()
@@ -67,8 +73,7 @@ def run_host(port: int) -> None:
         _p()
         _p(DIM + "  (send both to your guest over a secure channel)" + R)
     else:
-        my_ip = get_local_ip()
-        _p(G  + "  Your IP : " + CB + my_ip + R)
+        _p(G  + "  Your IP : " + CB + get_local_ip() + R)
         _p(G  + "  Code    : " + CB + code + R)
         _p()
         _p(DIM + "  (share both with your guest)" + R)
@@ -83,7 +88,7 @@ def run_host(port: int) -> None:
         print(
             f"\r  {Y}Waiting for guest...{R}  "
             f"{DIM}Time remaining: {m:02d}:{s:02d}{R}   ",
-            end="", flush=True
+            end="", flush=True,
         )
 
     try:
@@ -117,15 +122,11 @@ def run_host(port: int) -> None:
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONNECT (GUEST) MODE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_connect(port: int) -> None:
-    """
-    Connect to a host.
-
-    run_tor.sh pre-sets these env vars to skip interactive prompts:
-      SECURECHAT_PEER_HOST  = onion address
-      SECURECHAT_PEER_CODE  = session code
-    """
     clear()
     _p(GB + "  SecureChat — Connect to Host" + R)
     _p(DIM + "  ─────────────────────────────────────────────────" + R)
@@ -196,7 +197,10 @@ def run_connect(port: int) -> None:
         via_tor=via_tor,
     )
 
-#  SHARED: start Session + ChatUI
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SHARED: start Session + ChatUI + FileTransferChannel
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_chat(
     conn,
@@ -231,16 +235,21 @@ def _run_chat(
     )
     ui._session = session
 
-    # Wire up file transfer 
+    # ── File transfer channel ─────────────────────────────────────────────────
     ft = FileTransferChannel(
         session=session,
         key=key,
         push_system=ui.push_system,
-        push_progress=ui.push_system,
     )
     ft.install()
 
-    # Patch send_text: sends over wire AND echoes locally with sentinel
+    # ── Patch send_text to echo locally ──────────────────────────────────────
+    # ui.py's _handle_enter already calls session.send_text() directly.
+    # We patch it here so outgoing messages are echoed in the UI as "You:".
+    # NOTE: ui.py's _handle_enter must NOT echo locally itself — it relies on
+    # this patch exclusively. Check ui.py: _handle_enter calls send_text then
+    # pushes make_outgoing_msg. We override _handle_enter below to prevent that
+    # double-echo.
     _orig_send = session.send_text
 
     def _patched_send(text: str):
@@ -249,7 +258,11 @@ def _run_chat(
 
     session.send_text = _patched_send
 
-    # Replace _handle_enter with file-transfer-aware version
+    # ── Override _handle_enter to add file commands and fix double-echo ───────
+    # ui.py's original _handle_enter echoes the message itself AND calls
+    # session.send_text (which via _patched_send echoes again). We replace it
+    # entirely so the flow is:
+    #   type message → _patched_send → wire + echo once. Done.
     def _handle_enter(self=ui):
         buf = "".join(self._input_buf).strip()
         self._input_buf.clear()
@@ -258,54 +271,53 @@ def _run_chat(
         if not buf:
             return None
 
-        # Quit 
-        if buf.lower() in ("/quit", "/exit", "/q"):
+        low = buf.lower()
+
+        # ── Built-in commands ─────────────────────────────────────────────────
+        if low in ("/quit", "/exit", "/q"):
             return "quit"
 
-        # Help 
-        if buf.lower() == "/help":
+        if low == "/help":
             self.push_system(
                 "Commands: /quit  /clear  /help  |  ↑↓ scroll  |  Ctrl-W clear input"
             )
             self.push_system(
-                "File transfer: /sendfile <path>  |  /accept  |  /reject"
+                "File transfer: /sendfile <path>   /accept   /reject"
             )
             self.push_system(
-                f"Received files saved to: ~/securechat_received/"
+                "Received files → ~/securechat_received/"
             )
             return None
 
-        # ── Clear 
-        if buf.lower() == "/clear":
+        if low == "/clear":
             with self._msg_lock:
                 self._messages.clear()
             self._scroll = 0
             self._dirty.set()
             return None
 
-        # ── Send file 
-        if buf.lower().startswith("/sendfile"):
+        # ── File transfer commands ────────────────────────────────────────────
+        if low.startswith("/sendfile"):
             parts = buf.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
-                self.push_system("Usage: /sendfile <path>   e.g. /sendfile ~/docs/file.pdf")
+                self.push_system(
+                    "Usage: /sendfile <path>  e.g. /sendfile ~/docs/report.pdf"
+                )
                 return None
-            path_str = parts[1].strip()
             if not session.is_alive:
                 self.push_system("Session is closed — cannot send files.")
                 return None
-            ft.send_file(path_str)
+            ft.send_file(parts[1].strip())
             return None
 
-        # ── Accept incoming file 
-        if buf.lower() in ("/accept", "/accept file"):
+        if low in ("/accept", "/accept file"):
             if not ft.has_pending_offer():
                 self.push_system("No pending file offer to accept.")
                 return None
             ft.accept_offer()
             return None
 
-        # ── Reject incoming file 
-        if buf.lower().startswith("/reject"):
+        if low.startswith("/reject"):
             if not ft.has_pending_offer():
                 self.push_system("No pending file offer to reject.")
                 return None
@@ -314,27 +326,29 @@ def _run_chat(
             ft.reject_offer(reason)
             return None
 
-        # ── Regular chat message 
+        # ── Regular chat message ──────────────────────────────────────────────
+        # _patched_send writes to the wire AND echoes locally — no extra push here.
         if session.is_alive:
             try:
                 session.send_text(buf)
             except Exception as e:
                 self.push_system("Send error: " + str(e))
         else:
-            self.push_system("Session is closed — cannot send.")
+            self.push_system("Session is closed — cannot send messages.")
+
         return None
 
     ui._handle_enter = _handle_enter
 
+    # ── Start everything ──────────────────────────────────────────────────────
     session.start()
     tor_note = "  [via Tor]" if via_tor else ""
     ui.push_system(
-        "Secure channel open" + tor_note +
-        " — AES-256-GCM — 15 min limit — /help for commands"
+        "Secure channel open" + tor_note
+        + " — AES-256-GCM — 15 min limit — /help for commands"
     )
     ui.push_system(
-        f"File transfer ready — /sendfile <path> to send  |  "
-        f"files saved to ~/securechat_received/"
+        "Send files: /sendfile <path>  |  saved to ~/securechat_received/"
     )
 
     try:
@@ -345,7 +359,9 @@ def _run_chat(
         _wipe_and_exit()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _wipe_and_exit() -> None:
     clear()
@@ -355,8 +371,9 @@ def _wipe_and_exit() -> None:
     clear()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
 #  INTERACTIVE MENU  (direct invocation without run_tor.sh)
-
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def interactive_menu(port: int) -> None:
     clear()
@@ -377,6 +394,10 @@ def interactive_menu(port: int) -> None:
         clear()
         sys.exit(0)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
     if sys.version_info < (3, 8):
